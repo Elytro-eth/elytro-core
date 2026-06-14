@@ -1,0 +1,37 @@
+[project]
+name = "elytro-verity"
+verity = "9b0114efcc0af589af63dd3f2eafcdf1a24dbf1e"
+
+[paths]
+src = "verity/src"
+spec = "verity/spec"
+proof = "verity/proof"
+mirror_test = "test/verity"
+out = "artifacts"
+generated_solidity = "src/generated/verity"
+
+[modules]
+src = "ElytroVerity"
+spec = "ElytroVerity.Spec"
+proof = "ElytroVerity.Proof"
+
+[yul]
+solc = "0.8.33"
+optimizer = true
+optimizer_runs = 200
+yul_optimizer = true
+evm_version = "cancun"
+metadata_bytecode_hash = "none"
+
+[trust.allow_axioms]
+"Classical.choice" = "Lean standard classical reasoning accepted for this project"
+"propext" = "Lean standard propositional extensionality accepted for this project"
+"Quot.sound" = "Lean standard quotient soundness accepted for this project"
+
+[coverage.proof_only]
+"ChargeCore.charge_total_ceiling" = "proven against the Lean model of AgentAccount._charge; universally quantified over symbolic cap states"
+"ChargeCore.charge_accounting_exact" = "proven against the Lean model; exact spend accumulation (no loss/inflation)"
+"ChargeCore.charge_frame" = "proven against the Lean model; cap config (set/perTx/total) untouched by a charge"
+"ChargeCore.charge_over_pertx_reverts" = "proven against the Lean model; over-per-tx outflow leaves state unchanged"
+"ChargeCore.charge_over_total_reverts" = "proven against the Lean model; over-total outflow leaves state unchanged"
+"ChargeCore.charge_uncapped_reverts" = "proven against the Lean model; uncapped protected asset cannot move (fail-safe)"

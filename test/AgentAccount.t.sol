@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {AgentAccount} from "../src/AgentAccount.sol";
-import {MockERC20, LyingERC20, Sink, MockSwapRouter} from "./mocks/Mocks.sol";
+import {MockERC20, LyingERC20, Sink, MockSwapRouter, BrickableERC20} from "./mocks/Mocks.sol";
 
 contract AgentAccountTest is Test {
     AgentAccount account;
@@ -345,5 +345,65 @@ contract AgentAccountTest is Test {
         vm.prank(agent);
         vm.expectRevert(AgentAccount.MalformedCalldata.selector);
         account.executeAsAgent(_one(bob, 0, hex"01"));
+    }
+
+    // ── AUDIT regression fixes ───────────────────────────────────
+
+    // L1: 4+ byte calldata starting 0x00000000 must NOT pass as a NATIVE send.
+    function test_L1_ZeroPrefixedCalldataRejected() public {
+        _registerUSDCAgent(100e18, 0, 0, 0);
+        vm.prank(agent);
+        vm.expectRevert(AgentAccount.MalformedCalldata.selector);
+        account.executeAsAgent(_one(bob, 0, abi.encodePacked(bytes4(0x00000000), uint256(1))));
+    }
+
+    // I1: the owner and an active agent must stay disjoint principals.
+    function test_I1_OwnerCannotBeActiveAgent() public {
+        address x = makeAddr("dualrole");
+        vm.startPrank(owner);
+        account.setAgent(x, 0, uint48(block.timestamp + 1 days), true);
+        vm.expectRevert(bytes("owner is active agent"));
+        account.setOwner(x);
+        vm.stopPrank();
+    }
+
+    // M2: a known value-mover (ERC-777 send) on a NON-protected token is refused.
+    function test_M2_AltMoverOnUnprotectedReverts() public {
+        MockERC20 dai = new MockERC20("Dai", "DAI"); // not protected
+        bytes4 SEND = 0x9bd9bbc6;
+        vm.startPrank(owner);
+        account.setAgent(agent, 0, uint48(block.timestamp + 30 days), true);
+        account.setAllowedCall(agent, address(dai), SEND, true);
+        vm.stopPrank();
+        vm.prank(agent);
+        vm.expectRevert(abi.encodeWithSelector(AgentAccount.UnprotectedTokenTransfer.selector, address(dai)));
+        account.executeAsAgent(_one(address(dai), 0, abi.encodeWithSelector(SEND, bob, 1e18, "")));
+    }
+
+    // M1: a single sick protected token must not brick UNRELATED agent calls.
+    function test_M1_SickTokenDoesNotBrickUnrelated() public {
+        BrickableERC20 brk = new BrickableERC20();
+        brk.mint(address(account), 100e18);
+        vm.startPrank(owner);
+        account.setProtectedToken(address(brk), true);
+        account.setAgent(agent, 0, uint48(block.timestamp + 30 days), true);
+        account.setAllowedCall(agent, address(usdc), TRANSFER, true);
+        account.setCap(agent, address(usdc), 100e18, 0, 0, 0);
+        // also allow the agent to move brk (for the second assertion)
+        account.setAllowedCall(agent, address(brk), TRANSFER, true);
+        account.setCap(agent, address(brk), 100e18, 0, 0, 0);
+        vm.stopPrank();
+
+        brk.setBricked(true); // brk.balanceOf now reverts
+
+        // A pure-USDC transfer still succeeds (sick brk is skipped, not fatal).
+        vm.prank(agent);
+        account.executeAsAgent(_transferCall(address(usdc), bob, 40e18));
+        assertEq(usdc.balanceOf(bob), 40e18);
+
+        // But moving the sick token itself is blocked (cap can't be measured).
+        vm.prank(agent);
+        vm.expectRevert(abi.encodeWithSelector(AgentAccount.BalanceQueryFailed.selector, address(brk)));
+        account.executeAsAgent(_transferCall(address(brk), bob, 10e18));
     }
 }

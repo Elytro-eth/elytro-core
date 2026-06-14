@@ -1,0 +1,21 @@
+name = "elytro_verity"
+version = "0.1.0"
+defaultTargets = ["ElytroVerity.Proof"]
+buildDir = "artifacts/lean"
+
+[[require]]
+name = "verity"
+git = "https://github.com/lfglabs-dev/verity.git"
+rev = "9b0114efcc0af589af63dd3f2eafcdf1a24dbf1e"
+
+[[lean_lib]]
+name = "ElytroVerity"
+srcDir = "verity/src"
+
+[[lean_lib]]
+name = "ElytroVerity.Spec"
+srcDir = "verity/spec"
+
+[[lean_lib]]
+name = "ElytroVerity.Proof"
+srcDir = "verity/proof"

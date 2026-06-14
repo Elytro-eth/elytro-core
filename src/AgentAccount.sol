@@ -64,6 +64,9 @@ contract AgentAccount is IAccount {
 
     /// Selector used in the allowlist for a plain native-value send (empty calldata).
     bytes4 public constant NATIVE_SELECTOR = 0x00000000;
+    /// Bound on the protected-asset set: caps per-call gas and the blast radius
+    /// of a single sick token on the agent path (see _execAsAgent). (I3)
+    uint256 public constant MAX_PROTECTED_TOKENS = 32;
     bytes4 private constant TRANSFER_SEL = 0xa9059cbb; // transfer(address,uint256)
     bytes4 private constant ERC1271_MAGIC = 0x1626ba7e;
     bytes4 private constant ERC20_BALANCEOF = 0x70a08231; // balanceOf(address)
@@ -80,6 +83,10 @@ contract AgentAccount is IAccount {
     bytes4 private constant DAI_PERMIT_SEL = 0x8fcbaf0c; // DAI-style permit
     bytes4 private constant PERMIT2_APPROVE_SEL = 0x87517c45; // Permit2 approve
     bytes4 private constant TRANSFER_FROM_SEL = 0x23b872dd; // transferFrom(address,address,uint256)
+    // Known token value-movers an agent may use only on a PROTECTED (measured) token.
+    bytes4 private constant ERC777_SEND_SEL = 0x9bd9bbc6; // send(address,uint256,bytes)
+    bytes4 private constant TRANSFER_AND_CALL_SEL = 0x4000aea0; // transferAndCall(address,uint256,bytes)
+    bytes4 private constant TRANSFER_AND_CALL2_SEL = 0x1296ee62; // transferAndCall(address,uint256)
 
     // ─── Storage ────────────────────────────────────────────────────
 
@@ -185,6 +192,7 @@ contract AgentAccount is IAccount {
 
     function setOwner(address newOwner) external onlyOwnerOrSelf {
         require(newOwner != address(0), "owner=0");
+        require(!agents[newOwner].active, "owner is active agent"); // (I1) keep principals disjoint
         emit OwnerSet(owner, newOwner);
         owner = newOwner;
     }
@@ -203,6 +211,7 @@ contract AgentAccount is IAccount {
     function recoverOwner(address newOwner) external {
         if (recoveryModule == address(0) || msg.sender != recoveryModule) revert NotRecoveryModule();
         require(newOwner != address(0), "owner=0");
+        require(!agents[newOwner].active, "owner is active agent"); // (I1) keep principals disjoint
         emit OwnerSet(owner, newOwner);
         owner = newOwner;
     }
@@ -251,6 +260,7 @@ contract AgentAccount is IAccount {
         if (isProtected[token] == protectedState) return;
         isProtected[token] = protectedState;
         if (protectedState) {
+            require(protectedTokens.length < MAX_PROTECTED_TOKENS, "too many protected tokens"); // (I3)
             protectedTokens.push(token);
         } else {
             uint256 n = protectedTokens.length;
@@ -378,18 +388,31 @@ contract AgentAccount is IAccount {
             // grant. Reject so a value-send grant cannot authorize a fallback call.
             if (c.data.length > 0 && c.data.length < 4) revert MalformedCalldata();
             bytes4 sel = c.data.length == 0 ? NATIVE_SELECTOR : bytes4(c.data);
+            // (L1) A NATIVE (value-send) grant must authorize ONLY genuinely
+            // empty calldata — never a zero-prefixed 4+ byte fallback call.
+            if (sel == NATIVE_SELECTOR && c.data.length != 0) revert MalformedCalldata();
             if (_isForbiddenSelector(sel)) revert ApprovalForbidden();
             if (!allowedCall[agent][c.target][sel]) revert CallNotAllowlisted(c.target, sel);
-            // An agent may only move tokens it is value-accounted for: `transfer`
-            // is permitted only on a PROTECTED token (measured + capped below).
-            // Closes value exfiltration through tokens outside the protected set.
-            if (sel == TRANSFER_SEL && !isProtected[c.target]) revert UnprotectedTokenTransfer(c.target);
+            // An agent may only move tokens it is value-accounted for: a known
+            // value-mover selector is permitted only on a PROTECTED token
+            // (measured + capped below). Closes value exfiltration through tokens
+            // outside the protected set. NOTE: this is a best-effort blocklist of
+            // common movers; the owner remains responsible for not allowlisting an
+            // exotic value-mover on a non-protected token (see setAllowedCall).
+            if (_isValueMover(sel) && !isProtected[c.target]) revert UnprotectedTokenTransfer(c.target);
+            // (M1) Moving a PROTECTED token requires a readable balance so its cap
+            // can be enforced; if unreadable, block THIS call only.
+            if (_isValueMover(sel) && isProtected[c.target]) {
+                (bool okTarget,) = _tryBalanceOf(c.target);
+                if (!okTarget) revert BalanceQueryFailed(c.target);
+            }
 
             // ── Snapshot protected balances immediately BEFORE this call ──
             uint256 nativeBefore = address(this).balance;
             uint256[] memory tokBefore = new uint256[](n);
+            bool[] memory okBefore = new bool[](n);
             for (uint256 j; j < n; j++) {
-                tokBefore[j] = _erc20BalanceOf(protectedTokens[j]);
+                (okBefore[j], tokBefore[j]) = _tryBalanceOf(protectedTokens[j]);
             }
 
             // ── Execute ──
@@ -398,11 +421,16 @@ contract AgentAccount is IAccount {
             results[i] = ret;
 
             // ── Accumulate this call's gross decrease per protected asset ──
+            // (M1) A token unreadable before OR after is skipped, not fatal: a sick
+            // token cannot be moved by an agent call that does not target it (only
+            // the account can move its own tokens, and that path is checked above).
             uint256 nativeAfter = address(this).balance;
             if (nativeBefore > nativeAfter) outflow[0] += nativeBefore - nativeAfter;
             for (uint256 j; j < n; j++) {
-                uint256 tokAfter = _erc20BalanceOf(protectedTokens[j]);
-                if (tokBefore[j] > tokAfter) outflow[j + 1] += tokBefore[j] - tokAfter;
+                (bool okAfter, uint256 tokAfter) = _tryBalanceOf(protectedTokens[j]);
+                if (okBefore[j] && okAfter && tokBefore[j] > tokAfter) {
+                    outflow[j + 1] += tokBefore[j] - tokAfter;
+                }
             }
         }
 
@@ -452,10 +480,19 @@ contract AgentAccount is IAccount {
             || sel == PERMIT_SEL || sel == DAI_PERMIT_SEL || sel == PERMIT2_APPROVE_SEL || sel == TRANSFER_FROM_SEL;
     }
 
-    function _erc20BalanceOf(address token) internal view returns (uint256) {
-        (bool ok, bytes memory data) = token.staticcall(abi.encodeWithSelector(ERC20_BALANCEOF, address(this)));
-        if (!ok || data.length < 32) revert BalanceQueryFailed(token);
-        return abi.decode(data, (uint256));
+    /// Known token value-mover selectors — permitted only on a PROTECTED token.
+    function _isValueMover(bytes4 sel) internal pure returns (bool) {
+        return sel == TRANSFER_SEL || sel == ERC777_SEND_SEL || sel == TRANSFER_AND_CALL_SEL
+            || sel == TRANSFER_AND_CALL2_SEL;
+    }
+
+    /// Non-reverting balanceOf(this). Returns (false, 0) on any failure so a
+    /// single sick protected token can't brick unrelated agent calls. (M1)
+    function _tryBalanceOf(address token) internal view returns (bool ok, uint256 bal) {
+        bytes memory data;
+        (ok, data) = token.staticcall(abi.encodeWithSelector(ERC20_BALANCEOF, address(this)));
+        if (!ok || data.length < 32) return (false, 0);
+        return (true, abi.decode(data, (uint256)));
     }
 
     // ─── ERC-1271 (owner-only) ──────────────────────────────────────

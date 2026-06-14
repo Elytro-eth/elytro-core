@@ -147,14 +147,29 @@ contract GuardianRecoveryTest is Test {
         assertEq(account.owner(), owner);
     }
 
-    function test_GuardianVeto() public {
+    // (H1) A lone guardian can NO LONGER censor recovery — only the owner vetoes.
+    function test_GuardianCannotVeto_OwnerCan() public {
         bytes[] memory sigs = _guardianSigs(rescuer, THRESHOLD);
         recovery.scheduleRecovery(rescuer, sigs);
         vm.prank(gaddrs[0]);
+        vm.expectRevert(GuardianRecovery.NotRoot.selector);
+        recovery.cancelRecovery();
+        // owner can still veto a malicious recovery
+        vm.prank(owner);
         recovery.cancelRecovery();
         vm.warp(block.timestamp + DELAY);
         vm.expectRevert(GuardianRecovery.NothingScheduled.selector);
         recovery.executeRecovery();
+    }
+
+    // (L3) delay below MIN_DELAY (incl. 0) is rejected — preserves the veto window.
+    function test_L3_DelayTooShortRejected() public {
+        vm.prank(owner);
+        vm.expectRevert(GuardianRecovery.DelayTooShort.selector);
+        recovery.setDelay(0);
+        GuardianRecovery.GuardianSpec[] memory specs = _specs(gaddrs);
+        vm.expectRevert(GuardianRecovery.DelayTooShort.selector);
+        new GuardianRecovery(IRecoverable(address(account)), specs, THRESHOLD, 1, 0);
     }
 
     // ── replay safety: cancel invalidates collected signatures ───

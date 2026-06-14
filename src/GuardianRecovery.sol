@@ -33,6 +33,8 @@ contract GuardianRecovery {
     /// Upper bound on the recovery delay — guards against a units bug or an
     /// absurd value truncating when cast to uint64 in scheduleRecovery.
     uint256 public constant MAX_DELAY = 365 days;
+    /// Minimum recovery delay — `delay = 0` would nullify the veto window. (L3)
+    uint256 public constant MIN_DELAY = 1 hours;
 
     mapping(address => bool) public isGuardian;
     mapping(address => uint96) public guardianWeight;
@@ -77,6 +79,7 @@ contract GuardianRecovery {
     error DelayNotElapsed(uint256 nowTs, uint256 executeAfter);
     error AlreadyScheduled();
     error DelayTooLong();
+    error DelayTooShort();
     error BadConfig();
 
     constructor(
@@ -89,6 +92,7 @@ contract GuardianRecovery {
         account = _account;
         _setGuardians(specs, _threshold, _minClasses);
         if (_delay > MAX_DELAY) revert DelayTooLong();
+        if (_delay < MIN_DELAY) revert DelayTooShort();
         delay = _delay;
         emit DelaySet(_delay);
         DOMAIN_SEPARATOR = keccak256(
@@ -116,6 +120,7 @@ contract GuardianRecovery {
 
     function setDelay(uint256 _delay) external onlyRoot {
         if (_delay > MAX_DELAY) revert DelayTooLong();
+        if (_delay < MIN_DELAY) revert DelayTooShort();
         delay = _delay;
         emit DelaySet(_delay);
         _invalidate();
@@ -163,9 +168,12 @@ contract GuardianRecovery {
         emit RecoveryScheduled(newOwner, block.timestamp + delay, nonce);
     }
 
-    /// Veto: the owner OR any current guardian can cancel, invalidating sigs.
-    function cancelRecovery() external {
-        if (msg.sender != account.owner() && !isGuardian[msg.sender]) revert NotOwnerOrGuardian();
+    /// Veto: the OWNER cancels (anytime), invalidating any pending recovery and
+    /// collected sigs. (H1) Guardian veto is intentionally NOT permitted: a
+    /// single sub-threshold guardian could otherwise permanently censor recovery
+    /// (pre-emptive nonce bumps + front-running schedules). A guardian-QUORUM
+    /// veto is the documented enhancement if owner-absent veto is required.
+    function cancelRecovery() external onlyRoot {
         _invalidate();
         emit RecoveryCancelled(nonce);
     }

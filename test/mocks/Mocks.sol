@@ -102,3 +102,30 @@ contract MockSwapRouter {
         IERC20Min(tokenOut).transfer(msg.sender, amtOut);
     }
 }
+
+/// A token whose balanceOf reverts once "bricked" (pause/blacklist/bad upgrade).
+/// Used to prove a single sick protected token can't freeze unrelated agent calls.
+contract BrickableERC20 {
+    mapping(address => uint256) internal _bal;
+    bool public bricked;
+
+    function setBricked(bool b) external {
+        bricked = b;
+    }
+
+    function mint(address to, uint256 amt) external {
+        _bal[to] += amt;
+    }
+
+    function balanceOf(address a) external view returns (uint256) {
+        require(!bricked, "bricked");
+        return _bal[a];
+    }
+
+    function transfer(address to, uint256 amt) external returns (bool) {
+        require(_bal[msg.sender] >= amt, "balance");
+        _bal[msg.sender] -= amt;
+        _bal[to] += amt;
+        return true;
+    }
+}
