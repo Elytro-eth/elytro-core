@@ -186,4 +186,52 @@ contract GuardianRecoveryTest is Test {
         vm.expectRevert(AgentAccount.NotRecoveryModule.selector);
         account.recoverOwner(rescuer);
     }
+
+    // ── REGRESSION (red-team fixes) ──────────────────────────────
+
+    // C3: reconfiguring guardians must CLEAR the old set — a removed guardian
+    // loses all authority and can no longer count toward threshold.
+    function test_C3_SetGuardiansClearsOldSet() public {
+        address dropped = gaddrs[0];
+
+        // New set = {g1, g2} (drop g0), still threshold 2, ascending order.
+        address[] memory ng = new address[](2);
+        ng[0] = gaddrs[1];
+        ng[1] = gaddrs[2];
+        vm.prank(owner);
+        recovery.setGuardians(ng, 2);
+
+        assertFalse(recovery.isGuardian(dropped), "dropped guardian must be cleared");
+        assertTrue(recovery.isGuardian(gaddrs[1]));
+        assertTrue(recovery.isGuardian(gaddrs[2]));
+
+        // Sigs from {dropped g0, g1} now reach only 1 valid guardian → below threshold.
+        bytes32 d = recovery.recoveryDigest(rescuer);
+        bytes[] memory sigs = new bytes[](2);
+        sigs[0] = _sign(gpks[0], d); // dropped
+        sigs[1] = _sign(gpks[1], d); // current
+        vm.expectRevert(abi.encodeWithSelector(GuardianRecovery.ThresholdNotMet.selector, uint256(1), uint256(2)));
+        recovery.scheduleRecovery(rescuer, sigs);
+
+        // The current set {g1, g2} still works.
+        bytes[] memory good = new bytes[](2);
+        good[0] = _sign(gpks[1], d);
+        good[1] = _sign(gpks[2], d);
+        recovery.scheduleRecovery(rescuer, good);
+    }
+
+    // C6: cannot re-submit a schedule while one is pending (no delay-clock reset).
+    function test_C6_CannotRescheduleWhilePending() public {
+        bytes[] memory sigs = _guardianSigs(rescuer, THRESHOLD);
+        recovery.scheduleRecovery(rescuer, sigs);
+        vm.expectRevert(GuardianRecovery.AlreadyScheduled.selector);
+        recovery.scheduleRecovery(rescuer, sigs);
+    }
+
+    // U2: an absurd delay (would truncate to the past) is rejected.
+    function test_U2_DelayTooLongRejected() public {
+        vm.prank(owner);
+        vm.expectRevert(GuardianRecovery.DelayTooLong.selector);
+        recovery.setDelay(type(uint64).max);
+    }
 }

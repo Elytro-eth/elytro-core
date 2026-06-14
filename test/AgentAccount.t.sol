@@ -281,4 +281,69 @@ contract AgentAccountTest is Test {
         bytes memory sig = abi.encodePacked(r, s, v);
         assertEq(account.isValidSignature(hash, sig), bytes4(0xffffffff));
     }
+
+    // ── REGRESSION (red-team fixes) ──────────────────────────────
+
+    // C1: a same-asset inflow later in the batch must NOT mask an earlier outflow.
+    function test_C1_InflowCannotMaskOutflow() public {
+        // A source that sends USDC back into the account (yield-claim / rebase proxy).
+        MockSwapRouter src = new MockSwapRouter(address(usdc));
+        usdc.mint(address(src), 1000e18);
+
+        vm.startPrank(owner);
+        account.setAgent(agent, 0, uint48(block.timestamp + 30 days), true);
+        account.setAllowedCall(agent, address(usdc), TRANSFER, true);
+        account.setAllowedCall(agent, address(src), MockSwapRouter.deliver.selector, true);
+        account.setCap(agent, address(usdc), 100e18, 0, 0, 0);
+        vm.stopPrank();
+
+        // [transfer 150 out, claim 150 back] nets to 0 — old code charged 0.
+        AgentAccount.Call[] memory calls = new AgentAccount.Call[](2);
+        calls[0] = AgentAccount.Call(address(usdc), 0, abi.encodeWithSelector(TRANSFER, bob, 150e18));
+        calls[1] = AgentAccount.Call(address(src), 0, abi.encodeWithSelector(MockSwapRouter.deliver.selector, 150e18));
+
+        vm.prank(agent);
+        vm.expectRevert(
+            abi.encodeWithSelector(AgentAccount.PerTxCapExceeded.selector, address(usdc), uint256(150e18), uint256(100e18))
+        );
+        account.executeAsAgent(calls);
+    }
+
+    // C2: the approval ban is not just approve() — permit / setApprovalForAll too.
+    function test_C2_PermitSelectorForbidden() public {
+        _registerUSDCAgent(100e18, 0, 0, 0);
+        bytes memory permitData = abi.encodeWithSelector(0xd505accf, owner, bob, 1e18, 0, uint8(0), bytes32(0), bytes32(0));
+        vm.prank(agent);
+        vm.expectRevert(AgentAccount.ApprovalForbidden.selector);
+        account.executeAsAgent(_one(address(usdc), 0, permitData));
+    }
+
+    function test_C2_SetApprovalForAllForbidden() public {
+        _registerUSDCAgent(100e18, 0, 0, 0);
+        bytes memory data = abi.encodeWithSelector(0xa22cb465, bob, true);
+        vm.prank(agent);
+        vm.expectRevert(AgentAccount.ApprovalForbidden.selector);
+        account.executeAsAgent(_one(address(usdc), 0, data));
+    }
+
+    // C4: an agent cannot transfer a token outside the protected set.
+    function test_C4_CannotTransferUnprotectedToken() public {
+        MockERC20 dai = new MockERC20("Dai", "DAI");
+        dai.mint(address(account), 1000e18); // protected = false (never registered)
+        vm.startPrank(owner);
+        account.setAgent(agent, 0, uint48(block.timestamp + 30 days), true);
+        account.setAllowedCall(agent, address(dai), TRANSFER, true);
+        vm.stopPrank();
+        vm.prank(agent);
+        vm.expectRevert(abi.encodeWithSelector(AgentAccount.UnprotectedTokenTransfer.selector, address(dai)));
+        account.executeAsAgent(_transferCall(address(dai), bob, 100e18));
+    }
+
+    // C5: 1-3 bytes of calldata (a fallback call) is rejected, not treated as NATIVE.
+    function test_C5_ShortCalldataRejected() public {
+        _registerUSDCAgent(100e18, 0, 0, 0);
+        vm.prank(agent);
+        vm.expectRevert(AgentAccount.MalformedCalldata.selector);
+        account.executeAsAgent(_one(bob, 0, hex"01"));
+    }
 }

@@ -28,7 +28,14 @@ interface IRecoverable {
 contract GuardianRecovery {
     IRecoverable public immutable account;
 
+    /// Upper bound on the recovery delay — guards against a units bug or an
+    /// absurd value truncating when cast to uint64 in scheduleRecovery.
+    uint256 public constant MAX_DELAY = 365 days;
+
     mapping(address => bool) public isGuardian;
+    /// The active guardian set, kept explicitly so reconfiguration can CLEAR the
+    /// previous set (a removed guardian must lose all authority).
+    address[] private _guardianList;
     uint256 public guardianCount;
     uint256 public threshold;
     uint256 public delay;
@@ -62,10 +69,13 @@ contract GuardianRecovery {
     error ThresholdNotMet(uint256 got, uint256 need);
     error NothingScheduled();
     error DelayNotElapsed(uint256 nowTs, uint256 executeAfter);
+    error AlreadyScheduled();
+    error DelayTooLong();
 
     constructor(IRecoverable _account, address[] memory guardians, uint256 _threshold, uint256 _delay) {
         account = _account;
         _setGuardians(guardians, _threshold);
+        if (_delay > MAX_DELAY) revert DelayTooLong();
         delay = _delay;
         emit DelaySet(_delay);
         DOMAIN_SEPARATOR = keccak256(
@@ -92,6 +102,7 @@ contract GuardianRecovery {
     }
 
     function setDelay(uint256 _delay) external onlyRoot {
+        if (_delay > MAX_DELAY) revert DelayTooLong();
         delay = _delay;
         emit DelaySet(_delay);
         _invalidate();
@@ -114,6 +125,9 @@ contract GuardianRecovery {
     function scheduleRecovery(address newOwner, bytes[] calldata signatures) external {
         if (newOwner == address(0)) revert BadNewOwner();
         if (threshold == 0) revert NoGuardians();
+        // Must explicitly cancel an in-flight recovery before scheduling another;
+        // prevents a permissionless re-submit from resetting the delay clock.
+        if (pending.exists) revert AlreadyScheduled();
 
         bytes32 d = recoveryDigest(newOwner);
         address last = address(0);
@@ -150,28 +164,34 @@ contract GuardianRecovery {
     // ─── Internals ──────────────────────────────────────────────────
 
     function _setGuardians(address[] memory guardians, uint256 _threshold) internal {
-        // clear previous
-        // (cheap path: we never store the list, only the mapping + count; callers
-        // re-supply the full set, so zero the old by reconstructing is omitted —
-        // for a config change the root supplies the new full set and we trust it.)
         uint256 n = guardians.length;
         require(_threshold > 0 && _threshold <= n, "bad threshold");
-        // reset mapping for the NEW set is sufficient because scheduleRecovery
-        // only counts addresses currently flagged true; stale-true entries from a
-        // prior larger set would be a bug, so we require callers to pass a fresh
-        // module per guardian-set change OR keep sets monotonic. To be safe we
-        // explicitly set the provided set true and rely on root to redeploy for
-        // shrink. (Documented limitation; see README.)
+
+        // Clear the PREVIOUS set first — a removed guardian must lose all
+        // authority (it can otherwise still reach threshold or veto forever).
+        uint256 oldLen = _guardianList.length;
+        for (uint256 i; i < oldLen; i++) {
+            isGuardian[_guardianList[i]] = false;
+        }
+        delete _guardianList;
+
+        // Install the new set. Strictly ascending order guarantees distinctness.
         address last = address(0);
         for (uint256 i; i < n; i++) {
             address g = guardians[i];
             require(g > last, "guardians unordered/dup");
             last = g;
             isGuardian[g] = true;
+            _guardianList.push(g);
         }
         guardianCount = n;
         threshold = _threshold;
         emit GuardiansSet(n, _threshold);
+    }
+
+    /// The active guardian set.
+    function guardians() external view returns (address[] memory) {
+        return _guardianList;
     }
 
     function _invalidate() internal {

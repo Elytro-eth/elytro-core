@@ -62,10 +62,21 @@ contract AgentAccount {
 
     /// Selector used in the allowlist for a plain native-value send (empty calldata).
     bytes4 public constant NATIVE_SELECTOR = 0x00000000;
-    bytes4 private constant APPROVE_SEL = 0x095ea7b3; // approve(address,uint256)
-    bytes4 private constant INCREASE_ALLOWANCE_SEL = 0x39509351; // increaseAllowance(address,uint256)
+    bytes4 private constant TRANSFER_SEL = 0xa9059cbb; // transfer(address,uint256)
     bytes4 private constant ERC1271_MAGIC = 0x1626ba7e;
     bytes4 private constant ERC20_BALANCEOF = 0x70a08231; // balanceOf(address)
+
+    // Authorization-granting / pull selectors an agent may NEVER call. Selector
+    // blocklists are open-ended by nature, so this is defense-in-depth on top of
+    // the real control: an agent may only move PROTECTED tokens, and only via
+    // `transfer` (see executeAsAgent), so a standing allowance can never form.
+    bytes4 private constant APPROVE_SEL = 0x095ea7b3; // approve(address,uint256)
+    bytes4 private constant INCREASE_ALLOWANCE_SEL = 0x39509351; // increaseAllowance(address,uint256)
+    bytes4 private constant SET_APPROVAL_FOR_ALL_SEL = 0xa22cb465; // setApprovalForAll(address,bool)
+    bytes4 private constant PERMIT_SEL = 0xd505accf; // EIP-2612 permit
+    bytes4 private constant DAI_PERMIT_SEL = 0x8fcbaf0c; // DAI-style permit
+    bytes4 private constant PERMIT2_APPROVE_SEL = 0x87517c45; // Permit2 approve
+    bytes4 private constant TRANSFER_FROM_SEL = 0x23b872dd; // transferFrom(address,address,uint256)
 
     // ─── Storage ────────────────────────────────────────────────────
 
@@ -115,6 +126,8 @@ contract AgentAccount {
     error AgentExpired();
     error SelfCallForbidden();
     error ApprovalForbidden();
+    error MalformedCalldata();
+    error UnprotectedTokenTransfer(address token);
     error CallNotAllowlisted(address target, bytes4 selector);
     error CallFailed(uint256 index, bytes ret);
     error UncappedProtectedAssetMoved(address asset);
@@ -257,35 +270,55 @@ contract AgentAccount {
         if (block.timestamp < a.notBefore) revert AgentNotYetValid();
         if (block.timestamp > a.expiresAt) revert AgentExpired();
 
-        // ── Pre-flight: each call must be allowlisted, never self, never an approval.
-        for (uint256 i; i < calls.length; i++) {
-            Call calldata c = calls[i];
-            if (c.target == address(this)) revert SelfCallForbidden();
-            bytes4 sel = c.data.length >= 4 ? bytes4(c.data) : NATIVE_SELECTOR;
-            if (sel == APPROVE_SEL || sel == INCREASE_ALLOWANCE_SEL) revert ApprovalForbidden();
-            if (!allowedCall[agent][c.target][sel]) revert CallNotAllowlisted(c.target, sel);
-        }
-
-        // ── Snapshot protected balances (native + protected ERC-20s).
         uint256 n = protectedTokens.length;
-        uint256 nativeBefore = address(this).balance;
-        uint256[] memory tokBefore = new uint256[](n);
-        for (uint256 j; j < n; j++) {
-            tokBefore[j] = _erc20BalanceOf(protectedTokens[j]);
-        }
+        // Accumulated GROSS outflow: index 0 = native, 1..n = protectedTokens[i-1].
+        // Gross-per-call (not net-per-batch): a later inflow / rebase / yield-claim
+        // can never retroactively mask an earlier outflow.
+        uint256[] memory outflow = new uint256[](n + 1);
 
-        // ── Execute.
         results = new bytes[](calls.length);
         for (uint256 i; i < calls.length; i++) {
-            (bool ok, bytes memory ret) = calls[i].target.call{value: calls[i].value}(calls[i].data);
+            Call calldata c = calls[i];
+
+            // ── Per-call authorization ──
+            if (c.target == address(this)) revert SelfCallForbidden();
+            // 1-3 bytes of data is neither a clean 4-byte selector nor a native
+            // send; it would route to the target fallback under a NATIVE-only
+            // grant. Reject so a value-send grant cannot authorize a fallback call.
+            if (c.data.length > 0 && c.data.length < 4) revert MalformedCalldata();
+            bytes4 sel = c.data.length == 0 ? NATIVE_SELECTOR : bytes4(c.data);
+            if (_isForbiddenSelector(sel)) revert ApprovalForbidden();
+            if (!allowedCall[agent][c.target][sel]) revert CallNotAllowlisted(c.target, sel);
+            // An agent may only move tokens it is value-accounted for: `transfer`
+            // is permitted only on a PROTECTED token (measured + capped below).
+            // Closes value exfiltration through tokens outside the protected set.
+            if (sel == TRANSFER_SEL && !isProtected[c.target]) revert UnprotectedTokenTransfer(c.target);
+
+            // ── Snapshot protected balances immediately BEFORE this call ──
+            uint256 nativeBefore = address(this).balance;
+            uint256[] memory tokBefore = new uint256[](n);
+            for (uint256 j; j < n; j++) {
+                tokBefore[j] = _erc20BalanceOf(protectedTokens[j]);
+            }
+
+            // ── Execute ──
+            (bool ok, bytes memory ret) = c.target.call{value: c.value}(c.data);
             if (!ok) revert CallFailed(i, ret);
             results[i] = ret;
+
+            // ── Accumulate this call's gross decrease per protected asset ──
+            uint256 nativeAfter = address(this).balance;
+            if (nativeBefore > nativeAfter) outflow[0] += nativeBefore - nativeAfter;
+            for (uint256 j; j < n; j++) {
+                uint256 tokAfter = _erc20BalanceOf(protectedTokens[j]);
+                if (tokBefore[j] > tokAfter) outflow[j + 1] += tokBefore[j] - tokAfter;
+            }
         }
 
-        // ── Realized-value enforcement.
-        _charge(agent, address(0), nativeBefore, address(this).balance);
+        // ── Enforce caps on the accumulated gross outflow ──
+        _charge(agent, address(0), outflow[0]);
         for (uint256 j; j < n; j++) {
-            _charge(agent, protectedTokens[j], tokBefore[j], _erc20BalanceOf(protectedTokens[j]));
+            _charge(agent, protectedTokens[j], outflow[j + 1]);
         }
 
         emit AgentExecuted(agent, calls.length);
@@ -293,10 +326,9 @@ contract AgentAccount {
 
     // ─── Realized-value accounting ──────────────────────────────────
 
-    /// Charge the realized outflow of one protected asset against the agent's cap.
-    function _charge(address agent, address asset, uint256 balBefore, uint256 balAfter) internal {
-        if (balAfter >= balBefore) return; // inflow or unchanged — nothing to charge
-        uint256 outflow = balBefore - balAfter;
+    /// Charge an agent's accumulated gross outflow of one protected asset against its cap.
+    function _charge(address agent, address asset, uint256 outflow) internal {
+        if (outflow == 0) return; // no realized outflow — nothing to charge
 
         Cap storage c = _caps[agent][asset];
         // A protected asset that moves with no cap for this agent is unauthorized.
@@ -321,6 +353,12 @@ contract AgentAccount {
         c.spentTotal += outflow;
 
         emit Outflow(agent, asset, outflow);
+    }
+
+    /// Authorization-granting / pull selectors an agent may never call.
+    function _isForbiddenSelector(bytes4 sel) internal pure returns (bool) {
+        return sel == APPROVE_SEL || sel == INCREASE_ALLOWANCE_SEL || sel == SET_APPROVAL_FOR_ALL_SEL
+            || sel == PERMIT_SEL || sel == DAI_PERMIT_SEL || sel == PERMIT2_APPROVE_SEL || sel == TRANSFER_FROM_SEL;
     }
 
     function _erc20BalanceOf(address token) internal view returns (uint256) {
