@@ -52,6 +52,20 @@ A successful owner rotation is total control, so the entire safety budget lives 
 - A transient operator hand-off carries the classified principal from `validateUserOp` to `executeUserOp`; `executeUserOp` then routes through the same owner / agent-capability paths. A second same-sender op in one bundle reverts rather than reuse the first's authority.
 - Tested against a faithful `MockEntryPoint`, **and against the canonical EntryPoint v0.8 (`0x4337…F108`) on a Base mainnet fork** ([`test/EntryPointFork.t.sol`](test/EntryPointFork.t.sol)): a real agent-signed UserOp through genuine `handleOps` executes a capped transfer; an over-cap UserOp reverts on the cap with no value moved. Run with `RUN_FORK_TESTS=true forge test --match-path test/EntryPointFork.t.sol`.
 
+## Live on the Cleave testnet (real EntryPoint v0.8)
+
+Deployed and exercised on the Cleave testnet (anvil mainnet fork, chain `73571`) against the canonical EntryPoint v0.8 — the agent operating via real `handleOps`, not a mock:
+
+| Item | Value |
+|---|---|
+| Factory | `0xd7D5f4A79c5042161324376F37Dd3Db7bd3E5C2F` |
+| Agent account | `0x57871B921a9868A067E722Df6C2Dd0e81EDBA91C` |
+| Cap | per-tx 100, total 300 (TUSD) |
+| **In-cap** transfer (50) | tx `0x3233e704…65a` → **executed**, bob +50, account 1000→950, `spentTotal`=50 |
+| **Over-cap** transfer (150) | tx `0xb3aafb62…259` → op **refused** (`PerTxCapExceeded(…,150,100)`), `success=false`, **no value moved** |
+
+The realized-value cap held end-to-end on a live chain through the genuine EntryPoint. Harness: `script/CleaveE2E.s.sol` (deploy + provision) and `script/BuildOp.s.sol` (build/sign an agent UserOp → submit via `cast send`).
+
 ## Status
 
 ✅ **54/54 tests pass** (`forge test`) — `AgentAccount` (24) + `GuardianRecovery` (15, weighted + class-diverse) + `ERC4337` (7) + `AgentAccountFactory` (4) + an end-to-end `Lifecycle` capstone (1) + 3 fuzz **invariants** (128k calls each).
