@@ -50,7 +50,7 @@ A successful owner rotation is total control, so the entire safety budget lives 
 
 - `validateUserOp` recovers the signer and classifies it: **owner** → unrestricted (validationData 0); **active agent** → validationData packs the agent's `validAfter`/`validUntil` for the EntryPoint to enforce; anyone else → `SIG_VALIDATION_FAILED`. It's ERC-7562-clean (only own-storage reads, no external calls bar the EntryPoint prefund), so the capability/value checks run at *execution*, not validation.
 - A transient operator hand-off carries the classified principal from `validateUserOp` to `executeUserOp`; `executeUserOp` then routes through the same owner / agent-capability paths. A second same-sender op in one bundle reverts rather than reuse the first's authority.
-- Tested against a faithful `MockEntryPoint` (single-op validate→execute, sig + time-window honored). Wiring the canonical EntryPoint is a deploy-time step.
+- Tested against a faithful `MockEntryPoint`, **and against the canonical EntryPoint v0.8 (`0x4337…F108`) on a Base mainnet fork** ([`test/EntryPointFork.t.sol`](test/EntryPointFork.t.sol)): a real agent-signed UserOp through genuine `handleOps` executes a capped transfer; an over-cap UserOp reverts on the cap with no value moved. Run with `RUN_FORK_TESTS=true forge test --match-path test/EntryPointFork.t.sol`.
 
 ## Status
 
@@ -87,7 +87,7 @@ A multi-agent adversarial red-team (4 attacker lenses → skeptic verification �
 - **Passkey (P256/WebAuthn) root** — needs the RIP-7212 precompile (or a vendored verifier) and test vectors `vm.sign` can't produce. The ECDSA owner already serves as cold root, so this is an upgrade, not a gap.
 - **Per-period gas / op-count budget** — windowed counters in `validateUserOp` violate ERC-7562 bundler rules (the blueprint's open problem); needs a stateless or off-critical-path design.
 - **USD-denominated caps** — needs a price oracle (blueprint open risk); caps are token-native today.
-- **Canonical EntryPoint integration + testnet deploy** — `script/Deploy.s.sol` is ready; the deploy itself is the outward-facing gate.
+- **Testnet deploy** — `script/Deploy.s.sol` is ready and the wallet is fork-proven against the canonical EntryPoint v0.8; the live deploy itself is the outward-facing gate (needs a funded deployer key + RPC).
 
 ## Run
 
