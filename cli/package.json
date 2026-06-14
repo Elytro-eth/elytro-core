@@ -4,7 +4,7 @@
   "description": "Agent-facing CLI for the elytro-core agent-native smart account: realized-value caps + guardian recovery, deterministic JSON for AI agents.",
   "type": "module",
   "bin": { "elytro-agent": "./dist/elytro.js" },
-  "files": ["dist", "SKILL.md", "README.md"],
+  "files": ["dist", "SKILL.md", "README.md", "FRIEND_SETUP.md"],
   "scripts": {
     "build": "node build.mjs",
     "dev": "bun run elytro.ts",
