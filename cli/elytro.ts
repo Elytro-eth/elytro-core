@@ -1,4 +1,3 @@
-#!/usr/bin/env bun
 /**
  * elytro-agent — agent-facing CLI for the elytro-core agent-native smart account.
  *
@@ -26,10 +25,27 @@ import {
   type Address,
   type Hex,
 } from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
+import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 const ENTRYPOINT_DEFAULT = '0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108' as Address;
 const TRANSFER_SELECTOR = '0xa9059cbb' as Hex;
+// Defaults target the Cleave testnet (chain 73571) so a fresh install works
+// out of the box; override any of them with env vars or flags.
+const CLEAVE_RPC = 'https://foundry-production-85dd.up.railway.app';
+const CLEAVE_FACTORY = '0xd7D5f4A79c5042161324376F37Dd3Db7bd3E5C2F' as Address;
+const KEY_DIR = join(homedir(), '.elytro-agent');
+const KEY_FILE = join(KEY_DIR, 'agent.key');
+
+/// Resolve the AGENT session key: flag > env > stored vault file (from `keygen`).
+function loadAgentKey(opts: Record<string, string | undefined>): Hex {
+  const fromFile = existsSync(KEY_FILE) ? (readFileSync(KEY_FILE, 'utf8').trim() as Hex) : undefined;
+  const key = (opts.agentKey || process.env.ELYTRO_AGENT_KEY || fromFile) as Hex | undefined;
+  if (!key) fail(-32001, 'No agent key. Run `elytro-agent keygen` once (or set ELYTRO_AGENT_KEY).');
+  return key!;
+}
 
 // ─── output ──────────────────────────────────────────────────────
 function ok(result: unknown): never {
@@ -111,8 +127,7 @@ const ERC20_ABI = [
 
 // ─── config ──────────────────────────────────────────────────────
 function cfg(opts: Record<string, string | undefined>) {
-  const rpc = opts.rpc || process.env.ELYTRO_RPC;
-  if (!rpc) fail(-32001, 'No RPC. Set ELYTRO_RPC or pass --rpc.');
+  const rpc = opts.rpc || process.env.ELYTRO_RPC || CLEAVE_RPC;
   const chainId = Number(opts.chainId || process.env.ELYTRO_CHAIN_ID || '73571');
   const chain = defineChain({
     id: chainId,
@@ -122,7 +137,7 @@ function cfg(opts: Record<string, string | undefined>) {
   });
   const pub = createPublicClient({ chain, transport: http(rpc!) });
   const entryPoint = (opts.entrypoint || process.env.ELYTRO_ENTRYPOINT || ENTRYPOINT_DEFAULT) as Address;
-  const factory = (opts.factory || process.env.ELYTRO_FACTORY) as Address | undefined;
+  const factory = (opts.factory || process.env.ELYTRO_FACTORY || CLEAVE_FACTORY) as Address;
   return { rpc: rpc!, chain, pub, entryPoint, factory };
 }
 function ownerWallet(c: ReturnType<typeof cfg>, opts: Record<string, string | undefined>) {
@@ -131,9 +146,7 @@ function ownerWallet(c: ReturnType<typeof cfg>, opts: Record<string, string | un
   return createWalletClient({ account: privateKeyToAccount(key!), chain: c.chain, transport: http(c.rpc) });
 }
 function agentAccount(opts: Record<string, string | undefined>) {
-  const key = (opts.agentKey || process.env.ELYTRO_AGENT_KEY) as Hex | undefined;
-  if (!key) fail(-32001, 'No agent key. Set ELYTRO_AGENT_KEY or pass --agent-key.');
-  return privateKeyToAccount(key!);
+  return privateKeyToAccount(loadAgentKey(opts));
 }
 function saltOf(s: string): Hex {
   return s.startsWith('0x') && s.length === 66 ? (s as Hex) : keccak256(toBytes(s));
@@ -247,7 +260,10 @@ common(program.command('send'))
     const acct = getAddress(o.account), token = getAddress(o.token), to = getAddress(o.to);
     const amount = BigInt(o.amount);
     const agent = agentAccount(o);
-    const submitter = ownerWallet(c, o); // bundler/submitter (account pays its own prefund)
+    // The agent submits its OWN UserOp (acts as the bundler) so it never needs
+    // the owner key — only its session key + a little ETH for base gas, which
+    // the EntryPoint refunds to the beneficiary (the agent) below.
+    const submitter = createWalletClient({ account: agent, chain: c.chain, transport: http(c.rpc) });
 
     // preflight against the on-chain cap
     const cap = await readCap(c, acct, agent.address, token);
@@ -311,5 +327,37 @@ async function readCap(c: ReturnType<typeof cfg>, account: Address, agent: Addre
 async function readBal(c: ReturnType<typeof cfg>, token: Address, who: Address) {
   return (await c.pub.readContract({ address: token, abi: ERC20_ABI, functionName: 'balanceOf', args: [who] })) as bigint;
 }
+
+// keygen: generate + store this agent's session key (run once). The human
+// grants a cap to the printed address; the owner key is never involved.
+program
+  .command('keygen')
+  .description('Generate and store the agent session key (run once)')
+  .option('--force', 'overwrite an existing key')
+  .action((o: { force?: boolean }) => {
+    if (existsSync(KEY_FILE) && !o.force) {
+      const addr = privateKeyToAccount(readFileSync(KEY_FILE, 'utf8').trim() as Hex).address;
+      ok({ status: 'exists', agent: addr, keyFile: KEY_FILE, hint: 'Key already exists. Use --force to regenerate.' });
+    }
+    const pk = generatePrivateKey();
+    mkdirSync(KEY_DIR, { recursive: true });
+    writeFileSync(KEY_FILE, pk, { mode: 0o600 });
+    chmodSync(KEY_FILE, 0o600);
+    const addr = privateKeyToAccount(pk).address;
+    ok({
+      status: 'created',
+      agent: addr,
+      keyFile: KEY_FILE,
+      hint: `Give this agent address to the human (owner) to delegate a cap: elytro-agent grant --agent ${addr} --token <addr> --per-tx <atomic> --total <atomic>`,
+    });
+  });
+
+// whoami: print this agent's address (what the human grants a cap to).
+program
+  .command('whoami')
+  .option('--agent-key <hex>')
+  .action((o: Record<string, string | undefined>) => {
+    ok({ agent: agentAccount(o).address });
+  });
 
 program.parseAsync().catch((e) => fail(-32000, (e as Error).message?.split('\n')[0] ?? String(e)));
