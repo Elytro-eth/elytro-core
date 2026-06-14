@@ -31,13 +31,30 @@ Why the agent restrictions matter:
 - **Excluded from ERC-1271** → an agent that could sign off-chain (Permit / Permit2 / EIP-3009) would bypass every on-chain cap with zero on-chain footprint.
 - **Uncapped protected asset must not decrease** → fail-safe: if the owner allowlists a token but forgets a cap, the account refuses rather than leaking.
 
+## Recovery: agent drives, guardians authorize
+
+`src/GuardianRecovery.sol` proves the other half of the goal — **recover by agent**:
+
+> The agent can *drive* recovery (assemble guardian signatures off-chain and submit the permissionless on-chain txs) but can never *authorize* it — only a threshold of distinct guardians can, after a time-delay during which the owner or any guardian may veto.
+
+- `scheduleRecovery` is permissionless (the agent is a courier); it requires ≥ threshold distinct guardian signatures over an EIP-712 digest binding the full params (account, newOwner, nonce, delay).
+- `cancelRecovery` (owner or any guardian) bumps a nonce, invalidating the scheduled recovery *and* any collected signatures.
+- `executeRecovery` is permissionless after the delay; it rotates the owner via the account's `recoverOwner`, callable only by the wired module.
+
+A successful owner rotation is total control, so the entire safety budget lives in (unforgeable cross-guardian sigs) + (delay) + (reachable veto). Tests cover courier-not-authorizer, below-threshold, duplicate-signer, delay, owner/guardian veto, replay-invalidation, and post-recovery control.
+
 ## Status
 
-- `src/AgentAccount.sol` — the account. ✅ 19/19 tests pass (`forge test`).
-- Recovery (agent can *drive* but never *authorize*) — next.
-- ERC-4337 EntryPoint integration, passkey (P256) root, on-chain capability as a 4337 validator — see the rebuild blueprint.
+✅ **29/29 tests pass** (`forge test`) — `AgentAccount` (19) + `GuardianRecovery` (10).
 
-This is the spend-safety core (Phase 1 of the blueprint): a real on-chain cap that holds even if every off-chain service is gone.
+This is the on-chain core (blueprint Phases 1 + 3): caps and recovery that hold even if every off-chain Elytro service is gone.
+
+### Honest limitations (next)
+- **Protected-set boundary:** realized-value covers native + the owner-declared protected ERC-20s. A token outside that set, if the agent is allowlisted to touch it, is not value-bounded. The owner must enumerate holdings. (Blueprint open risk #1.)
+- **Fixed-window period cap** (resets when the window elapses), not a true sliding window.
+- **`GuardianRecovery.setGuardians` does not clear the prior set** on reconfigure (shrinking a guardian set requires a fresh module). Constructor set is exact.
+- **Compromised (not lost) owner key** can still veto a guardian rescue — an acknowledged tension; the blueprint's answer is step-up on high value + caps, not yet built here.
+- Not yet: ERC-4337 EntryPoint integration, passkey (P256) root, the on-chain capability as a 4337 validator, USD-denominated caps.
 
 ## Run
 

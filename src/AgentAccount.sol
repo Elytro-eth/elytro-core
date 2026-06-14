@@ -71,6 +71,10 @@ contract AgentAccount {
 
     address public owner;
 
+    /// Authorized recovery module (a GuardianRecovery). The ONLY non-owner that
+    /// may rotate the owner, and only via recoverOwner(). Set by root.
+    address public recoveryModule;
+
     mapping(address => Agent) public agents;
 
     /// agent => target => selector => allowed
@@ -91,6 +95,7 @@ contract AgentAccount {
     // ─── Events ─────────────────────────────────────────────────────
 
     event OwnerSet(address indexed previous, address indexed current);
+    event RecoveryModuleSet(address indexed module);
     event AgentSet(address indexed agent, uint48 notBefore, uint48 expiresAt, bool active);
     event AgentRevoked(address indexed agent);
     event AllowedCallSet(address indexed agent, address indexed target, bytes4 selector, bool allowed);
@@ -103,6 +108,7 @@ contract AgentAccount {
 
     error NotOwner();
     error NotOwnerOrSelf();
+    error NotRecoveryModule();
     error Reentrancy();
     error AgentInactive();
     error AgentNotYetValid();
@@ -142,6 +148,24 @@ contract AgentAccount {
     // ─── Owner (root) management ────────────────────────────────────
 
     function setOwner(address newOwner) external onlyOwnerOrSelf {
+        require(newOwner != address(0), "owner=0");
+        emit OwnerSet(owner, newOwner);
+        owner = newOwner;
+    }
+
+    function setRecoveryModule(address module) external onlyOwnerOrSelf {
+        recoveryModule = module;
+        emit RecoveryModuleSet(module);
+    }
+
+    /**
+     * @notice Rotate the owner via the authorized recovery module ONLY.
+     * @dev This is how guardians restore access without the current owner key.
+     *      The module enforces guardian threshold + time-delay + veto; this
+     *      account just trusts the wired module to call it after that process.
+     */
+    function recoverOwner(address newOwner) external {
+        if (recoveryModule == address(0) || msg.sender != recoveryModule) revert NotRecoveryModule();
         require(newOwner != address(0), "owner=0");
         emit OwnerSet(owner, newOwner);
         owner = newOwner;
