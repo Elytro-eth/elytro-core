@@ -1,0 +1,14 @@
+{
+  "name": "@elytro/agent-cli",
+  "version": "0.1.0",
+  "description": "Agent-facing CLI for the elytro-core agent-native smart account (realized-value caps + guardian recovery)",
+  "type": "module",
+  "bin": { "elytro-agent": "./elytro.ts" },
+  "scripts": {
+    "start": "bun run elytro.ts"
+  },
+  "dependencies": {
+    "commander": "^13.0.0",
+    "viem": "^2.31.7"
+  }
+}
