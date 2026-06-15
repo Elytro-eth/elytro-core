@@ -210,6 +210,16 @@ const EXEC_AGENT_ABI = [
 ] as const;
 const SIM_ABI = [...EXEC_AGENT_ABI, ...ACCOUNT_ERRORS] as const;
 
+// Open-mode / JIT execution surface. The agent calls these DIRECTLY (paying its
+// own gas, no owner key, no EntryPoint needed for a same-tx call): executeAsAgent
+// for any open-mode call, executeAsAgentJIT for approve-pull apps (deposit/swap).
+const AGENT_EXEC_ABI = [
+  { type: 'function', name: 'executeAsAgent', stateMutability: 'nonpayable', inputs: [CALL_TUPLE], outputs: [{ type: 'bytes[]' }] },
+  { type: 'function', name: 'executeAsAgentJIT', stateMutability: 'nonpayable', inputs: [{ type: 'address' }, { type: 'address' }, { type: 'uint256' }, CALL_TUPLE], outputs: [{ type: 'bytes[]' }] },
+  { type: 'function', name: 'openMode', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'bool' }] },
+] as const;
+const DAPP_SIM_ABI = [...AGENT_EXEC_ABI, ...ACCOUNT_ERRORS] as const;
+
 // ─── config ──────────────────────────────────────────────────────
 function cfg(opts: Record<string, string | undefined>) {
   const rpc = opts.rpc || process.env.ELYTRO_RPC || CLEAVE_RPC;
@@ -678,6 +688,79 @@ common(program.command('boost'))
       note: opSuccess === undefined
         ? `Could not find UserOperationEvent; verify on-chain (ETH spent ${ethSpent}, N received ${nReceived}).`
         : 'Boost (N) bought autonomously within the human-delegated native-ETH cap; ETH outflow charged against the cap.',
+    });
+  });
+
+// dapp: call ANY Ethereum app out of the box (open mode), bounded by the
+// realized-value cap. With --jit-* the call runs behind a just-in-time,
+// self-resetting allowance so approve-pull apps (deposits/swaps) work with no
+// standing allowance. The agent submits the call DIRECTLY (its own gas, no owner
+// key). No per-app allowlist or pre-approval needed when the account is in open mode.
+common(program.command('dapp'))
+  .description('Call any Ethereum app out of the box (open mode), bounded by the realized-value cap')
+  .requiredOption('--account <addr>')
+  .requiredOption('--to <addr>', 'target contract')
+  .requiredOption('--data <hex>', 'calldata for the target')
+  .option('--value <wei>', 'native ETH to send with the call', '0')
+  .option('--jit-spender <addr>', 'JIT allowance spender (e.g. the router/zap that pulls)')
+  .option('--jit-token <addr>', 'JIT allowance token (must be a protected/measured token)')
+  .option('--jit-amount <atomic>', 'exact JIT allowance to grant for this call')
+  .option('--dry-run', 'simulate only; do not broadcast')
+  .action(async (o) => {
+    const c = cfg(o);
+    const acct = getAddress(o.account), to = getAddress(o.to);
+    const data = o.data as Hex;
+    const value = BigInt(o.value);
+    const agent = agentAccount(o);
+    const call = { target: to, value, data };
+    const jit = o.jitSpender && o.jitToken && o.jitAmount;
+    const jitSpender = jit ? getAddress(o.jitSpender) : undefined;
+    const jitToken = jit ? getAddress(o.jitToken) : undefined;
+    const jitAmount = jit ? BigInt(o.jitAmount) : 0n;
+
+    const fn = jit ? 'executeAsAgentJIT' : 'executeAsAgent';
+    const args = jit ? [jitSpender, jitToken, jitAmount, [call]] : [[call]];
+
+    // Faithful preflight: eth_call the real agent path (open-mode allowlist skip +
+    // forbidden-surface + realized-value charge, and for JIT the approve+reset).
+    let predictedError: string | null = null;
+    try {
+      await c.pub.simulateContract({ address: acct, abi: DAPP_SIM_ABI, functionName: fn, args, account: agent.address });
+    } catch (e) {
+      const rev = (e as BaseError).walk?.((x) => x instanceof ContractFunctionRevertedError) as ContractFunctionRevertedError | undefined;
+      predictedError = rev?.data?.errorName ?? rev?.reason ?? 'UnknownRevert';
+    }
+    const decision = predictedError ? 'block' : 'allow';
+    if (decision === 'block') {
+      const isEscalate = ESCALATE_ERRORS.has(predictedError!);
+      if (o.dryRun) ok({ dryRun: true, decision, predictedError, account: acct, agent: agent.address, to, jit: Boolean(jit) });
+      fail(isEscalate ? -32010 : -32012,
+        isEscalate ? `Call refused (${predictedError}): outside the agent delegated mandate.` : `Call would fail to execute (${predictedError}).`,
+        { decision: isEscalate ? 'escalate' : 'failed', predictedError,
+          suggestion: isEscalate
+            ? 'Get human approval or have the human adjust the grant / native cap.'
+            : 'Check funding, that the account is in open mode, the JIT token is protected, or slippage. Not broadcast (no gas spent).' });
+    }
+    if (o.dryRun) ok({ dryRun: true, decision, predictedError: null, account: acct, agent: agent.address, to, jit: Boolean(jit), willSend: { to, value, jitToken, jitAmount } });
+
+    // Submit DIRECTLY as the agent (its own gas; no owner key, no EntryPoint).
+    const submitter = createWalletClient({ account: agent, chain: c.chain, transport: http(c.rpc) });
+    let hash: Hex;
+    try {
+      hash = await submitter.writeContract({ address: acct, abi: AGENT_EXEC_ABI, functionName: fn, args, gas: 3000000n, gasPrice: await legacyGas(c) });
+    } catch (e) {
+      const rev = (e as BaseError).walk?.((x) => x instanceof ContractFunctionRevertedError) as ContractFunctionRevertedError | undefined;
+      const name = rev?.data?.errorName ?? rev?.reason ?? 'UnknownRevert';
+      const isEscalate = ESCALATE_ERRORS.has(name);
+      fail(isEscalate ? -32010 : -32012, `Call reverted on-chain (${name}).`, { decision: isEscalate ? 'escalate' : 'failed', reverted: name });
+    }
+    const r = await c.pub.waitForTransactionReceipt({ hash: hash! });
+    ok({
+      status: r.status, txHash: hash!, account: acct, agent: agent.address, to, jit: Boolean(jit),
+      executed: r.status === 'success',
+      note: r.status === 'success'
+        ? 'Called the app autonomously within the realized-value cap (open mode / JIT). No per-app allowlist or standing approval was needed.'
+        : 'Transaction did not succeed; inspect on-chain.',
     });
   });
 
