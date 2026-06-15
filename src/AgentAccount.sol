@@ -87,6 +87,17 @@ contract AgentAccount is IAccount {
     bytes4 private constant ERC777_SEND_SEL = 0x9bd9bbc6; // send(address,uint256,bytes)
     bytes4 private constant TRANSFER_AND_CALL_SEL = 0x4000aea0; // transferAndCall(address,uint256,bytes)
     bytes4 private constant TRANSFER_AND_CALL2_SEL = 0x1296ee62; // transferAndCall(address,uint256)
+    // Additional value-mover selectors measured so an UNMEASURED asset cannot leave
+    // unseen once the allowlist is optional (OPEN mode). Deny-default: each reverts
+    // on a non-protected target via the value-mover gate in _execAsAgent.
+    bytes4 private constant SAFE_TRANSFER_FROM_721_SEL = 0x42842e0e; // safeTransferFrom(address,address,uint256)
+    bytes4 private constant SAFE_TRANSFER_FROM_721_DATA_SEL = 0xb88d4fde; // safeTransferFrom(address,address,uint256,bytes)
+    bytes4 private constant SAFE_TRANSFER_FROM_1155_SEL = 0xf242432a; // safeTransferFrom(address,address,uint256,uint256,bytes)
+    bytes4 private constant SAFE_BATCH_TRANSFER_1155_SEL = 0x2eb2c2d6; // safeBatchTransferFrom(...)
+    bytes4 private constant ERC4626_WITHDRAW_SEL = 0xb460af94; // withdraw(uint256,address,address)
+    bytes4 private constant ERC4626_REDEEM_SEL = 0xba087652; // redeem(uint256,address,address)
+    bytes4 private constant WETH_WITHDRAW_SEL = 0x2e1a7d4d; // withdraw(uint256)
+    bytes4 private constant ALLOWANCE_SELECTOR = 0xdd62ed3e; // allowance(address,address)
 
     // ─── Storage ────────────────────────────────────────────────────
 
@@ -124,6 +135,13 @@ contract AgentAccount is IAccount {
 
     bool private _locked;
 
+    /// agent => OPEN mode. When true, _execAsAgent skips the per-(target,selector)
+    /// allowlist so the agent may call ANY non-self target — still bounded by the
+    /// realized-value caps (only WHICH calls may be attempted widens, never how much
+    /// value may leave). Appended at the end of storage to preserve the existing
+    /// slot layout (and the Lean-proven _charge accounting it sits beside).
+    mapping(address => bool) public openMode;
+
     // ─── Events ─────────────────────────────────────────────────────
 
     event OwnerSet(address indexed previous, address indexed current);
@@ -135,6 +153,7 @@ contract AgentAccount is IAccount {
     event ProtectedTokenSet(address indexed token, bool protectedState);
     event AgentExecuted(address indexed agent, uint256 calls);
     event Outflow(address indexed agent, address indexed asset, uint256 amount);
+    event OpenModeSet(address indexed agent, bool on);
 
     // ─── Errors ─────────────────────────────────────────────────────
 
@@ -159,6 +178,7 @@ contract AgentAccount is IAccount {
     error PerPeriodCapExceeded(address asset, uint256 wouldSpend, uint256 cap);
     error TotalCapExceeded(address asset, uint256 wouldSpend, uint256 cap);
     error BalanceQueryFailed(address token);
+    error ApproveResetFailed(address token, address spender);
 
     // ─── Constructor ────────────────────────────────────────────────
 
@@ -231,6 +251,17 @@ contract AgentAccount is IAccount {
         require(target != address(this), "cannot allow self");
         allowedCall[agent][target][selector] = allowed;
         emit AllowedCallSet(agent, target, selector, allowed);
+    }
+
+    /// Enable OPEN mode for an agent: _execAsAgent skips the per-(target,selector)
+    /// allowlist so the agent may interact with any Ethereum app out of the box —
+    /// still bounded by the realized-value caps. Approvals stay reachable only via
+    /// the reset-guaranteed executeAsAgentJIT rail, and value-mover selectors still
+    /// revert on a non-protected target, so an unmeasured asset cannot leave.
+    function setOpenMode(address agent, bool on) external onlyOwnerOrSelf {
+        require(agent != address(0) && agent != owner, "bad agent");
+        openMode[agent] = on;
+        emit OpenModeSet(agent, on);
     }
 
     function setCap(
@@ -363,6 +394,37 @@ contract AgentAccount is IAccount {
         return _execAsAgent(msg.sender, calls);
     }
 
+    /**
+     * @notice Execute agent calls behind a JUST-IN-TIME, self-resetting allowance,
+     *         so deposit/swap apps that pull via transferFrom work out of the box
+     *         without a standing allowance ever forming.
+     * @dev Approves EXACTLY `exactAllowance` of a MEASURED `token` to `spender`,
+     *      runs `calls` under the same realized-value frame as executeAsAgent, then
+     *      forces the allowance back to 0 and ASSERTS it. The spender's transferFrom
+     *      pull is measured as a token outflow and charged against the agent's cap,
+     *      so the worst case is unchanged: at most the remaining cap of `token`
+     *      leaves. The plain-path approve ban (_isForbiddenSelector) stays intact —
+     *      this is the ONLY route by which an agent allowance exists, and it provably
+     *      leaves none behind.
+     */
+    function executeAsAgentJIT(address spender, address token, uint256 exactAllowance, Call[] calldata calls)
+        external
+        nonReentrant
+        returns (bytes[] memory results)
+    {
+        if (spender == address(this) || spender == owner) revert SelfCallForbidden();
+        // token must be measured (so the pull is charged via the realized-value engine).
+        if (!isProtected[token]) revert UnprotectedTokenTransfer(token);
+        // never stack on an existing standing allowance.
+        if (_readAllowance(token, spender) != 0) revert ApproveResetFailed(token, spender);
+        // approve EXACTLY the batch's required pull (not max) to bound the mid-tx window.
+        _approveChecked(token, spender, exactAllowance);
+        results = _execAsAgent(msg.sender, calls);
+        // force the allowance back to zero and PROVE none survives.
+        _approveChecked(token, spender, 0);
+        if (_readAllowance(token, spender) != 0) revert ApproveResetFailed(token, spender);
+    }
+
     /// Capability + realized-value enforcement, shared by the direct path
     /// (executeAsAgent) and the EntryPoint path (executeUserOp, agent-mode).
     function _execAsAgent(address agent, Call[] calldata calls) internal returns (bytes[] memory results) {
@@ -392,7 +454,13 @@ contract AgentAccount is IAccount {
             // empty calldata — never a zero-prefixed 4+ byte fallback call.
             if (sel == NATIVE_SELECTOR && c.data.length != 0) revert MalformedCalldata();
             if (_isForbiddenSelector(sel)) revert ApprovalForbidden();
-            if (!allowedCall[agent][c.target][sel]) revert CallNotAllowlisted(c.target, sel);
+            // OPEN mode skips the per-(target,selector) allowlist. The realized-value
+            // engine below stays the value bound: any outflow of a measured asset is
+            // charged against the cap, and a value-mover selector on a NON-protected
+            // target still reverts (UnprotectedTokenTransfer), so an unmeasured asset
+            // cannot leave unseen. Approvals are unreachable here (forbidden above) and
+            // exist only via the reset-guaranteed executeAsAgentJIT rail.
+            if (!openMode[agent] && !allowedCall[agent][c.target][sel]) revert CallNotAllowlisted(c.target, sel);
             // An agent may only move tokens it is value-accounted for: a known
             // value-mover selector is permitted only on a PROTECTED token
             // (measured + capped below). Closes value exfiltration through tokens
@@ -483,7 +551,27 @@ contract AgentAccount is IAccount {
     /// Known token value-mover selectors — permitted only on a PROTECTED token.
     function _isValueMover(bytes4 sel) internal pure returns (bool) {
         return sel == TRANSFER_SEL || sel == ERC777_SEND_SEL || sel == TRANSFER_AND_CALL_SEL
-            || sel == TRANSFER_AND_CALL2_SEL;
+            || sel == TRANSFER_AND_CALL2_SEL
+            // Extended mover universe so OPEN mode cannot let an unmeasured asset walk
+            // (each reverts on a non-protected target).
+            || sel == SAFE_TRANSFER_FROM_721_SEL || sel == SAFE_TRANSFER_FROM_721_DATA_SEL
+            || sel == SAFE_TRANSFER_FROM_1155_SEL || sel == SAFE_BATCH_TRANSFER_1155_SEL
+            || sel == ERC4626_WITHDRAW_SEL || sel == ERC4626_REDEEM_SEL || sel == WETH_WITHDRAW_SEL;
+    }
+
+    /// approve(spender, amount) tolerating non-bool-returning tokens; reverts on
+    /// an explicit `false`. Used only by the JIT rail (token is owner-vetted/protected).
+    function _approveChecked(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory ret) = token.call(abi.encodeWithSelector(APPROVE_SEL, spender, amount));
+        if (!ok || (ret.length >= 32 && !abi.decode(ret, (bool)))) revert ApproveResetFailed(token, spender);
+    }
+
+    /// allowance(this, spender); returns 0 on any read failure (JIT requires a
+    /// protected, standards-compliant token, so a sound read is expected).
+    function _readAllowance(address token, address spender) internal view returns (uint256) {
+        (bool ok, bytes memory ret) = token.staticcall(abi.encodeWithSelector(ALLOWANCE_SELECTOR, address(this), spender));
+        if (!ok || ret.length < 32) return 0;
+        return abi.decode(ret, (uint256));
     }
 
     /// Non-reverting balanceOf(this). Returns (false, 0) on any failure so a
