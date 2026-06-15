@@ -2,6 +2,8 @@
 
 A from-first-principles, **agent-native** Ethereum smart account. Clean-room rebuild — not derived from the existing Elytro CLI/contracts.
 
+> **🤖 For AI agents:** read [**AGENTS.md**](AGENTS.md). To *operate* a wallet: `npm i -g @elytro/agent-cli` ([npm](https://www.npmjs.com/package/@elytro/agent-cli)), then `elytro-agent keygen`. The deterministic-JSON commands, trust model, and error codes are in AGENTS.md; the Claude Code skill is `SKILL.md` in that package. To *work on this repo*: build/test/conventions are in AGENTS.md too.
+
 ## Thesis
 
 An AI agent should be able to operate a wallet on a human's behalf, but its authority must be bounded by **the contract refusing**, not by an LLM obeying prose or a backend staying honest.
