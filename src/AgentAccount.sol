@@ -22,7 +22,14 @@ import {IAccount, PackedUserOperation} from "./interfaces/IERC4337.sol";
  * value the decoder never sees), the account snapshots its protected-asset
  * balances before the agent's calls and asserts the realized outflow after.
  * Value is bounded by the balance delta, so it holds through any router or
- * DeFi path.
+ * DeFi path. SCOPE (audit 2026-06-15): this bounds assets the account HOLDS
+ * (native + protected tokens it owns), measured by its own balance delta. It
+ * does NOT bound value the account is OWED inside an external protocol — e.g.
+ * rewards or a withdrawal paid by a protocol directly to an agent-chosen
+ * recipient, which never transit the account's balance — nor an unmeasured
+ * token swept via a pre-existing standing allowance. Keep every token the
+ * account holds or has approved in the protected set; prefer recipient == self
+ * for payout calls. Agent gas prefund is bounded by the native cap (HIGH-1 fix).
  *
  * Principals are on-chain-distinct:
  *   - owner (root): full power; the human's cold key. Manages agents, caps,
@@ -284,10 +291,15 @@ contract AgentAccount is IAccount {
     }
 
     /// Enable OPEN mode for an agent: _execAsAgent skips the per-(target,selector)
-    /// allowlist so the agent may interact with any Ethereum app out of the box —
-    /// still bounded by the realized-value caps. Approvals stay reachable only via
-    /// the reset-guaranteed executeAsAgentJIT rail, and value-mover selectors still
-    /// revert on a non-protected target, so an unmeasured asset cannot leave.
+    /// allowlist so the agent may interact with any Ethereum app out of the box,
+    /// bounded by the realized-value caps on assets the account HOLDS. Approvals
+    /// stay reachable only via the reset-guaranteed executeAsAgentJIT rail, and a
+    /// recognized value-mover selector still reverts on a non-protected target.
+    /// CAVEAT (audit 2026-06-15): this does NOT make an unmeasured asset unmovable —
+    /// it can still leave via a payout-to-recipient call (claim/withdrawTo to an
+    /// attacker) or a router sweeping a token the owner pre-approved that is not in
+    /// the protected set. Enable open mode only when every held/approved token is
+    /// in the protected (measured) set.
     function setOpenMode(address agent, bool on) external onlyOwnerOrSelf {
         require(agent != address(0) && agent != owner, "bad agent");
         openMode[agent] = on;
@@ -390,6 +402,7 @@ contract AgentAccount is IAccount {
         if (_operatorPending) revert OperatorPending();
 
         address signer = _recover(userOpHash, userOp.signature);
+        bool isAgentOp = false;
         if (signer != address(0) && signer == owner) {
             _operatorIsOwner = true;
             _operatorPending = true;
@@ -397,6 +410,7 @@ contract AgentAccount is IAccount {
         } else if (signer != address(0) && agents[signer].active) {
             _operator = signer;
             _operatorPending = true;
+            isAgentOp = true;
             // EntryPoint enforces the time window from the packed validationData.
             validationData = _packValidation(agents[signer].notBefore, agents[signer].expiresAt);
         } else {
@@ -404,6 +418,15 @@ contract AgentAccount is IAccount {
         }
 
         if (missingAccountFunds > 0) {
+            // An AGENT's gas prefund is native-value spend and MUST be bounded by the
+            // agent's native cap — else a compromised agent drains ETH via a huge
+            // maxFeePerGas during VALIDATION, before any execution-time cap runs. The
+            // owner is unbounded. Conservative: charges the full missingAccountFunds
+            // (the EntryPoint's unused-gas refund is not credited back to the cap), and
+            // reverts if the agent has no/insufficient native cap (an agent must hold a
+            // native budget to drive UserOps). _caps is the account's own storage, so
+            // this validation-phase write is ERC-7562-clean.
+            if (isAgentOp) _charge(signer, address(0), missingAccountFunds);
             (bool ok,) = payable(msg.sender).call{value: missingAccountFunds}("");
             ok; // ignore; EntryPoint reverts on its own accounting if underpaid
         }

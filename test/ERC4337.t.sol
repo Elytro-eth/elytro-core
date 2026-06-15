@@ -128,4 +128,48 @@ contract ERC4337Test is Test {
         vm.expectRevert(AgentAccount.NoOperator.selector);
         account.executeUserOp(calls);
     }
+
+    // ── HIGH-1 regression: agent gas prefund is bounded by the native cap ──
+    // (audit 2026-06-15) A compromised agent must not drain native ETH via a huge
+    // maxFeePerGas prefund during validation, before any execution-time cap runs.
+
+    function test_PoC_AgentPrefundWithNoNativeCapReverts() public {
+        bytes32 h = keccak256("op-noCap");
+        PackedUserOperation memory op = _op("", agentPk, h);
+        vm.prank(address(ep));
+        vm.expectRevert(abi.encodeWithSelector(AgentAccount.UncappedProtectedAssetMoved.selector, address(0)));
+        account.validateUserOp(op, h, 1 ether); // agent has no native cap → refused
+    }
+
+    function test_PoC_AgentPrefundOverNativeCapReverts() public {
+        vm.prank(owner);
+        account.setCap(agent, address(0), 0.1 ether, 0, 0, 1 ether);
+        bytes32 h = keccak256("op-overCap");
+        PackedUserOperation memory op = _op("", agentPk, h);
+        vm.prank(address(ep));
+        vm.expectRevert(
+            abi.encodeWithSelector(AgentAccount.PerTxCapExceeded.selector, address(0), uint256(0.2 ether), uint256(0.1 ether))
+        );
+        account.validateUserOp(op, h, 0.2 ether);
+    }
+
+    function test_AgentPrefundWithinNativeCapSucceeds() public {
+        vm.prank(owner);
+        account.setCap(agent, address(0), 0.1 ether, 0, 0, 1 ether);
+        bytes32 h = keccak256("op-inCap");
+        PackedUserOperation memory op = _op("", agentPk, h);
+        vm.prank(address(ep));
+        account.validateUserOp(op, h, 0.05 ether);
+        assertEq(account.getCap(agent, address(0)).spentTotal, 0.05 ether, "prefund charged to native cap");
+    }
+
+    function test_OwnerPrefundIsUnbounded() public {
+        // The owner is root: a large prefund is fine even with no native cap, and the
+        // agent's native accounting is untouched.
+        bytes32 h = keccak256("op-owner");
+        PackedUserOperation memory op = _op("", ownerPk, h);
+        vm.prank(address(ep));
+        account.validateUserOp(op, h, 5 ether);
+        assertEq(account.getCap(agent, address(0)).spentTotal, 0);
+    }
 }

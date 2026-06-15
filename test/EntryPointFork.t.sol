@@ -60,6 +60,8 @@ contract EntryPointForkTest is Test {
         account.setAgent(agent, 0, uint48(block.timestamp + 30 days), true);
         account.setAllowedCall(agent, address(usdc), MockERC20.transfer.selector, true);
         account.setCap(agent, address(usdc), 100e18, 0, 0, 300e18);
+        // Native cap for the agent's gas prefund (bounded since the HIGH-1 fix).
+        account.setCap(agent, address(0), 1 ether, 0, 0, 10 ether);
         vm.stopPrank();
     }
 

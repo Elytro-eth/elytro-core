@@ -701,7 +701,7 @@ common(program.command('boost'))
 // standing allowance. The agent submits the call DIRECTLY (its own gas, no owner
 // key). No per-app allowlist or pre-approval needed when the account is in open mode.
 common(program.command('dapp'))
-  .description('Call any Ethereum app out of the box (open mode), bounded by the realized-value cap')
+  .description('Call any Ethereum app out of the box (open mode), bounded by the realized-value cap on HELD assets (not value paid out to a chosen recipient)')
   .requiredOption('--account <addr>')
   .requiredOption('--to <addr>', 'target contract')
   .requiredOption('--data <hex>', 'calldata for the target')
